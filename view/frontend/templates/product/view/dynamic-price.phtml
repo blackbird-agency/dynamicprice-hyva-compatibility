@@ -1,0 +1,176 @@
+<?php
+/**
+ * Blackbird Dynamic Price Hyvä Compatibility
+ *
+ * @copyright Copyright (c) 2026 Blackbird Agency (https://black.bird.eu)
+ * @license   MIT, see LICENSE.txt
+ */
+
+declare(strict_types=1);
+
+use Blackbird\DynamicPrice\ViewModel\ConfigDataProvider;
+use Hyva\Theme\Model\ViewModelRegistry;
+use Hyva\Theme\ViewModel\HyvaCsp;
+use Hyva\Theme\ViewModel\ProductPage;
+use Magento\Framework\Escaper;
+use Magento\Framework\View\Element\Template;
+
+/**
+ * Product sub-total (port of Blackbird_DynamicPrice/js/product/view/dynamic-price.js). One block per configured
+ * position; the requests are shared by all blocks of the page (window.blackbirdDynamicPrice), each block only displays
+ * the amount it receives through the "dynamic-price-updated" window event.
+ * Written CSP-compatible: no expression with arguments in the markup.
+ *
+ * @var Template $block
+ * @var Escaper $escaper
+ * @var ViewModelRegistry $viewModels
+ * @var HyvaCsp|null $hyvaCsp
+ */
+
+// the price controller only knows the simple product or the chosen variant of a configurable: other types
+// (bundle selections, downloadable links…) would show a wrong amount
+$supportedTypes = ['simple', 'virtual', 'configurable'];
+$product = $viewModels->require(ProductPage::class)->getProduct();
+if (!$product || !$product->isSaleable() || !in_array($product->getTypeId(), $supportedTypes, true)) {
+    return;
+}
+/** @var ConfigDataProvider $configProvider */
+$configProvider = $block->getData('viewModel');
+$settings = $configProvider->getSettings((array) $block->getData('settings'));
+// delay 0 is the unsaved default (the admin field requires > 0): wait for the end of the typing anyway
+$delay = (int) ($settings['delay'] ?? 0);
+$config = [
+    'productId' => (int) $product->getId(),
+    'requestUrl' => (string) ($settings['requestUrl'] ?? ''),
+    'eventAction' => (string) ($settings['eventAction'] ?? 'change input'),
+    'delay' => $delay > 0 ? $delay : 250,
+    'enableLoader' => filter_var($settings['enableLoader'] ?? false, FILTER_VALIDATE_BOOLEAN),
+];
+?>
+<script>
+    (() => {
+        if (window.blackbirdDynamicPrice) {
+            return;
+        }
+        const FORM = 'product_addtocart_form';
+        const started = {};
+        const cache = {};
+        const pending = {};
+        let timer = null;
+        let sequence = 0;
+
+        const broadcast = (productId, detail) => window.dispatchEvent(new CustomEvent('dynamic-price-updated', {
+            detail: Object.assign({productId}, detail)
+        }));
+
+        window.blackbirdDynamicPrice = {
+            // called by every subtotal block: the first one of a product binds the listeners and computes
+            start(config) {
+                const form = document.getElementById(FORM);
+                if (started[config.productId] || !form) {
+                    return;
+                }
+                started[config.productId] = true;
+                const update = () => this.request(form, config);
+                window.addEventListener('update-qty-' + config.productId, update);
+                config.eventAction.split(/\s+/).filter(Boolean)
+                    .forEach((eventName) => form.addEventListener(eventName, update));
+                update();
+            },
+            request(form, config) {
+                window.clearTimeout(timer);
+                const data = new FormData(form);
+                const qty = Number(data.get('qty'));
+                const current = ++sequence;
+                // a configurable without a chosen variant has no meaningful price yet
+                const missingOption = [...form.querySelectorAll('[name^="super_attribute["]')]
+                    .some((field) => !data.get(field.name));
+                if (!(qty > 0) || missingOption) {
+                    broadcast(config.productId, {amount: '', loading: false});
+                    return;
+                }
+                const params = new URLSearchParams(data);
+                // the form values (qty included) identify a price, as in the Luma widget
+                const key = [...params.entries()].filter(([name]) => name !== 'form_key')
+                    .map(([, value]) => value).join('-');
+                // the field may still hold the full page cache value when the first request starts
+                params.set('form_key', hyva.getFormKey());
+                if (cache[key] !== undefined) {
+                    broadcast(config.productId, {amount: hyva.formatPrice(cache[key]), loading: false});
+                    return;
+                }
+                timer = window.setTimeout(() => {
+                    config.enableLoader && broadcast(config.productId, {loading: true});
+                    const separator = config.requestUrl.includes('?') ? '&' : '?';
+                    const url = config.requestUrl + separator + params;
+                    const load = () => fetch(url, {headers: {'X-Requested-With': 'XMLHttpRequest'}})
+                        .then((response) => {
+                            if (!response.ok) {
+                                throw new Error(response.statusText);
+                            }
+                            return response;
+                        });
+                    // one request per form state; a network failure is retried once
+                    pending[key] = pending[key] || load().catch(() => load()).then((response) => response.json())
+                        .finally(() => delete pending[key]);
+                    pending[key]
+                        .then((result) => {
+                            if (result.backUrl) {
+                                window.location = result.backUrl;
+                                return;
+                            }
+                            if (!result.success) {
+                                throw new Error('no price');
+                            }
+                            cache[key] = result.finalPrice * qty;
+                            current === sequence && broadcast(config.productId, {amount: hyva.formatPrice(cache[key])});
+                        })
+                        // never leave the amount of another quantity on screen
+                        .catch(() => current === sequence && broadcast(config.productId, {amount: ''}))
+                        .finally(() => {
+                            current === sequence && broadcast(config.productId, {loading: false});
+                        });
+                }, config.delay);
+            }
+        };
+
+        function initDynamicPrice() {
+            let config = {};
+            return {
+                amount: '',
+                loading: false,
+                init() {
+                    config = JSON.parse(this.$el.dataset.dynamicPrice);
+                    window.blackbirdDynamicPrice.start(config);
+                },
+                onUpdate(event) {
+                    if (event.detail.productId !== config.productId) {
+                        return;
+                    }
+                    if (event.detail.amount !== undefined) {
+                        this.amount = event.detail.amount;
+                    }
+                    if (event.detail.loading !== undefined) {
+                        this.loading = event.detail.loading;
+                    }
+                },
+                // visible with an amount, or while it is computed (loader)
+                isShown() {
+                    return this.amount !== '' || this.loading;
+                }
+            };
+        }
+
+        window.addEventListener('alpine:init', () => Alpine.data('initDynamicPrice', initDynamicPrice), {once: true});
+    })();
+</script>
+<?php isset($hyvaCsp) && $hyvaCsp->registerInlineScript() ?>
+<div class="price-subtotal flex items-center gap-2 <?= $escaper->escapeHtmlAttr((string) $block->getData('css_class')) ?>"
+     data-dynamic-price="<?= $escaper->escapeHtmlAttr(json_encode($config)) ?>"
+     x-data="initDynamicPrice" @dynamic-price-updated.window="onUpdate" x-show="isShown" x-cloak
+     aria-live="polite">
+    <span class="text-gray-700"><?= $escaper->escapeHtml(__('Subtotal')) ?></span>
+    <span class="price font-semibold" x-text="amount"></span>
+    <span data-dynamic-price-loader x-show="loading" x-cloak aria-hidden="true"
+          class="inline-block w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin"></span>
+</div>

@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<page xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="urn:magento:framework:View/Layout/etc/page_configuration.xsd">
+    <body>
+        <!-- Hyvä product-info.phtml renders only the children it names: move the subtotal blocks next to them -->
+        <move element="blackbird.dynamicPrice.product.view.under.sku" destination="product.info.stockqty"/>
+        <move element="blackbird.dynamicPrice.product.view.under.price" destination="product.info.additional.actions"
+              before="-"/>
+        <!-- the shortcut buttons block renders all its children right under the price / add to cart row -->
+        <move element="blackbird.dynamicPrice.product.view.under.add.to.cart" destination="addtocart.shortcut.buttons"/>
+        <referenceBlock name="blackbird.dynamicPrice.product.view.under.price">
+            <arguments>
+                <argument name="css_class" xsi:type="string">mr-auto self-center</argument>
+            </arguments>
+        </referenceBlock>
+    </body>
+</page>
